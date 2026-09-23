@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# sbfspot-mqtt — read an SMA Sunny Boy over Bluetooth and publish it to Home Assistant over MQTT.
+#
+# SBFspot does the talking to the inverter. This program is everything around it: the loop that
+# runs SBFspot, the translation of a reading into Home Assistant MQTT discovery, and the
+# publishing. It is a program and not a folder of add-on scripts because an add-on is only one
+# way to run it — it takes files and paths as arguments, needs no Home Assistant, and can be
+# exercised on anything with a broker.
+#
+# Read-only, deliberately: `-settime` is never passed, and the SBFspot configuration it generates
+# sets `SynchTime=0`. Upstream's default for that is 1, and on a Bluetooth connection it writes
+# the plant clock to the inverter on *every* poll.
+set -euo pipefail
+
+readonly VERSION=0.1.0
+
+# Filled in by cmd_discover before anything is published; declared so that `set -u` reports a
+# programming mistake rather than an unset variable in the middle of a JSON payload.
+DEVICE_NAME=""
+DEVICE_MODEL=""
+DEVICE_SW_VERSION=""
+DEVICE_SERIAL=""
+
+# ---------------------------------------------------------------------------------------------
+# Output. Plain lines, one per event, timestamped the way an add-on log expects to read them.
+# ---------------------------------------------------------------------------------------------
+log() {
+    local level="$1"; shift
+    printf '[%s] %s: %s\n' "$(date +%H:%M:%S)" "${level}" "$*"
+}
+info() { log INFO "$@"; }
+warn() { log WARNING "$@" >&2; }
+die() { log ERROR "$@" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+sbfspot-mqtt — an SMA Sunny Boy over Bluetooth, published to Home Assistant over MQTT.
+
+  watch            poll on an interval, publish, and publish discovery (the normal mode)
+  poll             read and publish once
+  discover         read a payload on stdin and publish MQTT discovery from it
+  publish          SBFspot's MQTT publisher interface; called by SBFspot, not by hand
+  offline          mark the inverter offline on the availability topic, then exit
+  generate-config  write the SBFspot configuration from the options
+  version          print the version
+
+Common arguments:
+  --options FILE   JSON with bt_address, password, plantname, interval, log_level
+  --mqtt FILE      JSON with host, port, username, password, topic, availability_topic,
+                   discovery_prefix
+  --sbfspot PATH   the SBFspot binary (default: /usr/bin/sbfspot/SBFspot)
+
+watch and poll also accept --interval SECONDS, generate-config needs --target FILE, and publish
+takes SBFspot's own `-m <json>`.
+
+Options come from files because that is what the add-on has; they are read when they are needed,
+so a credential never has to be on a command line or in an environment listing.
+EOF
+}
+
+# ---------------------------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------------------------
+options_file=""
+mqtt_file=""
+sbfspot_bin="/usr/bin/sbfspot/SBFspot"
+interval=""
+config_target=""
+publish_message=""
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --options) options_file="${2:?--options needs a file}"; shift 2 ;;
+            --mqtt) mqtt_file="${2:?--mqtt needs a file}"; shift 2 ;;
+            --sbfspot) sbfspot_bin="${2:?--sbfspot needs a path}"; shift 2 ;;
+            --interval) interval="${2:?--interval needs a number}"; shift 2 ;;
+            --target) config_target="${2:?--target needs a file}"; shift 2 ;;
+            -m) publish_message="${2-}"; shift 2 ;;
+            *) die "unknown argument: $1 (try --help)" ;;
+        esac
+    done
+}
+
+option() {
+    [[ -n "${options_file}" ]] || die "--options is required"
+    [[ -r "${options_file}" ]] || die "cannot read ${options_file}"
+    jq -r "$1" "${options_file}"
+}
+
+mqtt_field() {
+    [[ -n "${mqtt_file}" ]] || die "--mqtt is required"
+    [[ -r "${mqtt_file}" ]] || die "cannot read ${mqtt_file}"
+    jq -r "$1" "${mqtt_file}"
+}
+
+# ---------------------------------------------------------------------------------------------
+# MQTT. mosquitto_pub and mosquitto_sub are what SBFspot itself would use; the credentials come
+# from the file, so SBFspot's own command line carries a path and never a password.
+# ---------------------------------------------------------------------------------------------
+mqtt_pub() {
+    local topic="$1" message="$2" host port username password
+    host="$(mqtt_field '.host')"
+    port="$(mqtt_field '.port')"
+    username="$(mqtt_field '.username // ""')"
+    password="$(mqtt_field '.password // ""')"
+
+    local args=( -h "${host}" -p "${port}" -t "${topic}" -m "${message}" -r )
+    # Either, not both: a broker with a password and no user name is unusual but real, and
+    # requiring a user name before sending the password would drop it without saying so.
+    if [[ -n "${username}" || -n "${password}" ]]; then
+        args+=( -u "${username}" -P "${password}" )
+    fi
+
+    # mosquitto_pub has no connect timeout: against a broker that is unreachable rather than
+    # refusing, it waits for the kernel's TCP timeout, which is long enough to swallow a poll.
+    timeout 15 mosquitto_pub "${args[@]}"
+}
+
+mqtt_get() {
+    local topic="$1" host port username password
+    host="$(mqtt_field '.host')"
+    port="$(mqtt_field '.port')"
+    username="$(mqtt_field '.username // ""')"
+    password="$(mqtt_field '.password // ""')"
+
+    local args=( -h "${host}" -p "${port}" )
+    if [[ -n "${username}" || -n "${password}" ]]; then
+        args+=( -u "${username}" -P "${password}" )
+    fi
+    # -W bounds the wait for a message, not the connection; timeout covers the other half.
+    timeout 20 mosquitto_sub "${args[@]}" -t "${topic}" -C 1 -W 10 2> /dev/null || true
+}
+
+# ---------------------------------------------------------------------------------------------
+# The SBFspot configuration. Generated, never shipped: it contains the inverter's password.
+# ---------------------------------------------------------------------------------------------
+cmd_generate_config() {
+    [[ -n "${config_target}" ]] || die "generate-config needs --target"
+    generate_config_into "${config_target}"
+}
+
+generate_config_into() {
+    local target="$1"
+
+    local bt_address password plantname timezone zonespec
+    bt_address="$(option '.bt_address // ""')"
+    [[ -n "${bt_address}" ]] || die "bt_address is empty: set the inverter's Bluetooth address.
+It is in Sunny Explorer under the device information, and in the Sunny Beam's plant menu."
+    password="$(option '.password // ""')"
+    plantname="$(option '.plantname // "MyPlant"')"
+
+    # SBFspot builds its MQTT command line as a shell string and quotes the message with single
+    # quotes, so a quote in this value truncates the JSON before it is published. Refused here,
+    # where the message can say which field and why.
+    case "${plantname}" in
+        *"'"*|*'"'*) die "plantname contains a quote (' or \"), which SBFspot's MQTT command line cannot carry" ;;
+    esac
+
+    # SBFspot validates the timezone against the boost database next to it and refuses to start
+    # on a value it cannot find there — `UTC` included, which is not one of its region names: the
+    # file starts at Africa/Abidjan. The add-on sets TZ; this is the fallback for when nothing did.
+    zonespec="$(dirname "${sbfspot_bin}")/date_time_zonespec.csv"
+    timezone="${TZ:-}"
+    if [[ -z "${timezone}" ]] || ! grep -q "^\"${timezone}\"," "${zonespec}" 2> /dev/null; then
+        warn "Timezone '${timezone:-<unset>}' is not one of the zones SBFspot knows; using Europe/Brussels, the default upstream ships."
+        timezone="Europe/Brussels"
+    fi
+
+    # Only the keys SBFspot acts on, and only the ones that are a decision. `SynchTime=0` is the
+    # one that matters most: its default is 1, and that writes the plant clock over Bluetooth.
+    cat > "${target}" <<EOF
+# Generated by sbfspot-mqtt at every start. Do not edit: it is overwritten.
+BTAddress=${bt_address}
+Password=${password}
+Plantname=${plantname}
+MIS_Enabled=0
+BTConnectRetries=10
+SynchTime=0
+Timezone=${timezone}
+Locale=en-US
+DateTimeFormat=%Y-%m-%dT%H:%M:%S
+DateFormat=%Y-%m-%d
+TimeFormat=%H:%M:%S
+DecimalPoint=dot
+CSV_Export=0
+OutputPath=/tmp/sbfspot-mqtt/%Y
+OutputPathEvents=/tmp/sbfspot-mqtt/%Y/Events
+MQTT_Publisher=$(readlink -f "$0")
+MQTT_PublisherArgs=publish --mqtt "${mqtt_file}" -m "{{message}}"
+MQTT_Topic=$(mqtt_field '.topic')
+MQTT_ItemFormat="{key}": {value}
+MQTT_ItemDelimiter=comma
+MQTT_Data=Timestamp,Plantname,InvSerial,InvName,InvTime,InvStatus,InvTemperature,InvGridRelay,InvClass,InvType,InvSwVer,EToday,ETotal,PACTot,PDC,IDC,UDC,GridFreq,OperTm,FeedTm
+EOF
+
+    chmod 600 "${target}"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Publishing one reading. SBFspot calls this as `publish --mqtt FILE -m '<json>'`, so the shape of
+# the arguments is SBFspot's, not a choice.
+#
+# Two of its habits are handled here rather than documented away:
+#
+#   * `to_keyvalue()` ends with `boost::replace_all(key_value, "\"\"", "\"")`, so an empty string
+#     value arrives unterminated — `"InvName": ""` becomes `"InvName": "` — and that is what an
+#     inverter nobody named produces.
+#   * the message is quoted with a single quote, so a `'` inside a value cuts it off and takes
+#     everything after it. That one cannot be repaired: what follows is gone.
+# ---------------------------------------------------------------------------------------------
+valid_payload() {
+    printf '%s' "$1" | jq -e 'type == "object" and (length > 0)' > /dev/null
+}
+
+cmd_publish() {
+    local message="${publish_message}"
+    [[ -n "${message}" ]] || die "publish needs a message (-m)"
+
+    if ! valid_payload "${message}"; then
+        # The repair of the empty-value case, and only it: `: "` where the next thing is the
+        # quote that opens another key. Narrow on purpose — a value that merely begins with a
+        # comma is legal, and a broader pattern would rewrite it and refuse a payload that was
+        # repairable. The second expression is the same corruption in the last position.
+        local repaired
+        repaired="$(printf '%s' "${message}" | sed -E 's/: ",(")/: "",\1/g; s/: "}$/: ""}/g')"
+        if valid_payload "${repaired}"; then
+            warn "repaired an empty string value in SBFspot's payload (upstream collapses \"\" into \")"
+            message="${repaired}"
+        else
+            warn "refusing to publish a payload that is not a non-empty JSON object"
+            warn "a payload cut off mid-value is usually a single quote in a name: the inverter's"
+            warn "name as set in Sunny Explorer, or plantname, because SBFspot quotes its message"
+            warn "with one. Raw payload follows:"
+            printf '%s\n' "${message}" >&2
+            return 1
+        fi
+    fi
+
+    mqtt_pub "$(mqtt_field '.topic')" "${message}"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Discovery. The pool of possible channels is upstream's and which of them carry a real value
+# depends on the model, its firmware and its strings, so the sensor set is not a wish list: this
+# reads the keys out of a real payload and publishes a sensor for each one it has a mapping for.
+# A key with no mapping is reported and skipped, which is how a channel nobody has seen yet gets
+# noticed instead of invented.
+# ---------------------------------------------------------------------------------------------
+publish_sensor() {
+    # publish_sensor <node_id> <key> <name> <unit> <device_class> <state_class> <icon> <category>
+    local node_id="$1" key="$2" name="$3" unit="${4:-}" device_class="${5:-}"
+    local state_class="${6:-}" icon="${7:-}" category="${8:-}"
+
+    local prefix state_topic availability_topic device_name model sw_version serial
+    prefix="$(mqtt_field '.discovery_prefix // "homeassistant"')"
+    state_topic="$(mqtt_field '.topic')"
+    availability_topic="$(mqtt_field '.availability_topic')"
+    device_name="${DEVICE_NAME}" model="${DEVICE_MODEL}" sw_version="${DEVICE_SW_VERSION}" serial="${DEVICE_SERIAL}"
+
+    local config
+    config="$(jq -n \
+        --arg name "${name}" \
+        --arg unique_id "${node_id}_$(printf '%s' "${key}" | tr '[:upper:]' '[:lower:]')" \
+        --arg state_topic "${state_topic}" \
+        --arg value_template "{{ value_json.${key} }}" \
+        --arg availability_topic "${availability_topic}" \
+        --arg device_name "${device_name}" \
+        --arg device_id "${node_id}" \
+        --arg model "${model}" \
+        --arg sw_version "${sw_version}" \
+        --arg serial "${serial}" \
+        --arg unit "${unit}" \
+        --arg device_class "${device_class}" \
+        --arg state_class "${state_class}" \
+        --arg icon "${icon}" \
+        --arg category "${category}" \
+        '{
+            name: $name,
+            unique_id: $unique_id,
+            state_topic: $state_topic,
+            value_template: $value_template,
+            availability_topic: $availability_topic,
+            payload_available: "online",
+            payload_not_available: "offline",
+            device: {
+                identifiers: [$device_id],
+                name: $device_name,
+                manufacturer: "SMA Solar Technology AG",
+                model: $model,
+                sw_version: $sw_version,
+                serial_number: $serial
+            },
+            unit_of_measurement: $unit,
+            device_class: $device_class,
+            state_class: $state_class,
+            icon: $icon,
+            entity_category: $category
+        }
+        | walk(if type == "object" then with_entries(select(.value != null and .value != "")) else . end)'
+    )"
+
+    mqtt_pub "${prefix}/sensor/${node_id}/$(printf '%s' "${key}" | tr '[:upper:]' '[:lower:]')/config" "${config}"
+}
+
+cmd_discover() {
+    local payload
+    payload="$(cat)"
+    valid_payload "${payload}" || die "the payload on stdin is not a non-empty JSON object; no discovery published"
+
+    local serial
+    serial="$(jq -r '.InvSerial // ""' <<< "${payload}")"
+    [[ -n "${serial}" ]] || die "the payload has no InvSerial: there is no stable identifier to publish under"
+
+    # `InvName` is what the inverter was named in Sunny Explorer and is empty when nobody named
+    # it; the fallback names the model instead of inventing a name.
+    DEVICE_SERIAL="${serial}"
+    DEVICE_MODEL="$(jq -r '.InvType // ""' <<< "${payload}")"
+    DEVICE_SW_VERSION="$(jq -r '.InvSwVer // ""' <<< "${payload}")"
+    DEVICE_NAME="$(jq -r '.InvName // ""' <<< "${payload}")"
+    local node_id="sbfspot_${serial}"
+    if [[ -z "${DEVICE_NAME}" ]]; then
+        DEVICE_NAME="${DEVICE_MODEL:+SMA ${DEVICE_MODEL}}"
+        DEVICE_NAME="${DEVICE_NAME:-SMA inverter ${serial}}"
+    fi
+
+    local key
+    while read -r key; do
+        case "${key}" in
+            # Device identity: it belongs in the device registration, not in a sensor.
+            InvSerial|InvName|InvClass|InvType|InvSwVer|Plantname) ;;
+            PACTot) publish_sensor "${node_id}" "${key}" "Power" "W" "power" "measurement" "mdi:flash" ;;
+            EToday) publish_sensor "${node_id}" "${key}" "Energy today" "kWh" "energy" "total_increasing" "mdi:solar-power" ;;
+            ETotal) publish_sensor "${node_id}" "${key}" "Energy total" "kWh" "energy" "total_increasing" "mdi:solar-power" ;;
+            InvStatus) publish_sensor "${node_id}" "${key}" "Status" "" "" "" "mdi:information-outline" ;;
+            InvTemperature) publish_sensor "${node_id}" "${key}" "Temperature" "°C" "temperature" "measurement" "mdi:thermometer" ;;
+            InvGridRelay) publish_sensor "${node_id}" "${key}" "Grid relay" "" "" "" "mdi:electric-switch" "diagnostic" ;;
+            InvTime) publish_sensor "${node_id}" "${key}" "Inverter time" "" "" "" "mdi:clock-outline" "diagnostic" ;;
+            GridFreq) publish_sensor "${node_id}" "${key}" "Grid frequency" "Hz" "frequency" "measurement" "mdi:sine-wave" ;;
+            OperTm) publish_sensor "${node_id}" "${key}" "Operating time" "h" "duration" "total_increasing" "mdi:timer-outline" ;;
+            FeedTm) publish_sensor "${node_id}" "${key}" "Feed-in time" "h" "duration" "total_increasing" "mdi:timer-outline" ;;
+            Timestamp) publish_sensor "${node_id}" "${key}" "Data timestamp" "" "" "" "mdi:clock-check-outline" "diagnostic" ;;
+            UDC[0-9]*) publish_sensor "${node_id}" "${key}" "DC voltage string ${key#UDC}" "V" "voltage" "measurement" "mdi:solar-panel" ;;
+            IDC[0-9]*) publish_sensor "${node_id}" "${key}" "DC current string ${key#IDC}" "A" "current" "measurement" "mdi:solar-panel" ;;
+            PDC[0-9]*) publish_sensor "${node_id}" "${key}" "DC power string ${key#PDC}" "W" "power" "measurement" "mdi:solar-panel" ;;
+            *) warn "no mapping for key '${key}' — extending the map in cmd_discover is what publishes it" ;;
+        esac
+    done < <(jq -r 'keys[]' <<< "${payload}")
+
+    info "published discovery under $(mqtt_field '.discovery_prefix // "homeassistant"')/sensor/${node_id}/ for device ${DEVICE_NAME}"
+}
+
+cmd_offline() {
+    mqtt_pub "$(mqtt_field '.availability_topic')" offline || true
+}
+
+# ---------------------------------------------------------------------------------------------
+# Polling
+# ---------------------------------------------------------------------------------------------
+state_topic() { mqtt_field '.topic'; }
+availability_topic() { mqtt_field '.availability_topic'; }
+
+cmd_poll() {
+    local config rc=0
+    config="$(mktemp)"
+    generate_config_into "${config}"
+
+    local poll=( "${sbfspot_bin}" -q -ad0 -am0 -finq -mqtt "-cfg${config}" )
+    # `-cfg` takes its path attached: SBFspot reads it as `argv[i] + 4`, and a space is answered
+    # with "Invalid argument: -cfg" and nothing else. `-q` keeps the version banner and the
+    # argument dump out of every poll. Upstream applies quiet *after* the verbosity, so a level
+    # alongside it would be decoration; debug is the full dump, and no quiet.
+    if [[ "$(option '.log_level // "info"')" == "debug" ]]; then
+        poll=( "${sbfspot_bin}" -ad0 -am0 -finq -mqtt "-cfg${config}" -v5 )
+    fi
+
+    mkdir -p /tmp/sbfspot-mqtt
+    "${poll[@]}" || rc=$?
+    rm -f "${config}"
+    return "${rc}"
+}
+
+cmd_watch() {
+    local interval_seconds="${interval:-}"
+    if [[ -z "${interval_seconds}" ]]; then
+        interval_seconds="$(option '.interval // 60')"
+    fi
+    [[ "${interval_seconds}" =~ ^[0-9]+$ ]] || die "interval is not a number: '${interval_seconds}'"
+
+    if [[ -n "$(mqtt_field '.password // ""')" && -z "$(mqtt_field '.username // ""')" ]]; then
+        warn "the broker password is set with an empty user name: it is sent anyway, and most brokers reject that. Fill in one, or both."
+    fi
+
+    info "SBFspot $("${sbfspot_bin}" -version 2> /dev/null || true)"
+    info "inverter $(option '.bt_address') at $(option '.plantname // "MyPlant"'), polled every ${interval_seconds}s"
+    info "broker $(mqtt_field '.host'):$(mqtt_field '.port'), state on $(state_topic)"
+
+    local failures=0 availability="" published_keys=""
+    while :; do
+        if cmd_poll; then
+            if (( failures > 0 )); then
+                info "poll succeeded again after ${failures} failed attempt(s)"
+            fi
+            failures=0
+            if [[ "${availability}" != "online" ]]; then
+                # An unreachable broker must not end the loop: the next cycle tries again, and the
+                # last state is not recorded, so it does.
+                if mqtt_pub "$(availability_topic)" online; then
+                    info "marked the inverter online on $(availability_topic)"
+                    availability="online"
+                else
+                    warn "could not publish 'online' to $(availability_topic); will retry"
+                fi
+            fi
+            local keys payload
+            payload="$(mqtt_get "$(state_topic)")"
+            if [[ -z "${payload}" ]]; then
+                warn "no payload on $(state_topic) to publish discovery from"
+            else
+                keys="$(jq -r 'keys | sort | join(",")' <<< "${payload}" 2> /dev/null || true)"
+                if [[ -n "${keys}" && "${keys}" != "${published_keys}" ]]; then
+                    if printf '%s' "${payload}" | cmd_discover; then
+                        published_keys="${keys}"
+                    fi
+                fi
+            fi
+        else
+            failures=$((failures + 1))
+            # The explanation on the first failure, and a counter after that: a bridge that
+            # cannot reach the inverter fails every interval, and three lines of prose a minute
+            # is how a log becomes something nobody reads.
+            if (( failures == 1 )); then
+                warn "poll failed. The inverter is asleep, out of range, or another Bluetooth"
+                warn "master (Sunny Beam, Sunny Explorer, Webbox) is connected to it — it answers"
+                warn "one at a time."
+            else
+                warn "poll failed again (${failures} in a row)"
+            fi
+            if (( failures >= 3 )) && [[ "${availability}" != "offline" ]]; then
+                if mqtt_pub "$(availability_topic)" offline; then
+                    info "marked the inverter offline on $(availability_topic)"
+                    availability="offline"
+                else
+                    warn "could not publish 'offline' to $(availability_topic); will retry"
+                fi
+            fi
+        fi
+        sleep "${interval_seconds}"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+main() {
+    local command="${1:-}"
+    [[ -n "${command}" ]] || { usage; exit 2; }
+    shift || true
+
+    case "${command}" in
+        --help|-h|help) usage; exit 0 ;;
+        version|--version) printf '%s\n' "${VERSION}"; exit 0 ;;
+    esac
+
+    parse_args "$@"
+
+    case "${command}" in
+        generate-config) cmd_generate_config ;;
+        publish) cmd_publish ;;
+        discover) cmd_discover ;;
+        offline) cmd_offline ;;
+        poll) cmd_poll ;;
+        watch) cmd_watch ;;
+        *) die "unknown command: ${command} (try --help)" ;;
+    esac
+}
+
+main "$@"

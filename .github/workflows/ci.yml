@@ -1,0 +1,47 @@
+name: check
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check.sh
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The broker is the package's, reconfigured to accept anonymous connections: the packaged
+      # unit starts on the same port with a configuration that refuses them, and the tests publish
+      # anonymously to a throwaway broker on purpose. The loop is what makes a red run say
+      # "broker" rather than leave the first assertion to guess.
+      - name: Install jq, shellcheck and a broker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq mosquitto mosquitto-clients shellcheck
+          sudo mkdir -p /etc/mosquitto/conf.d
+          printf 'listener 1883 127.0.0.1\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/zz-ci.conf > /dev/null
+          sudo systemctl restart mosquitto || sudo mosquitto -c /etc/mosquitto/mosquitto.conf -d
+          for _ in $(seq 1 20); do
+            if mosquitto_pub -h localhost -t smoke -m ok 2> /dev/null; then
+              echo "broker accepting anonymous connections on 1883"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "no broker on 1883 after 20 seconds; what is there:"
+          ss -lntp | grep 1883 || true
+          ps aux | grep -i '[m]osquitto' || true
+          sudo tail -30 /var/log/mosquitto/mosquitto.log || true
+          exit 1
+
+      - name: check.sh
+        run: ./check.sh
