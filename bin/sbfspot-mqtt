@@ -12,7 +12,7 @@
 # the plant clock to the inverter on *every* poll.
 set -euo pipefail
 
-readonly VERSION=0.1.0
+readonly VERSION=0.1.1
 
 # Filled in by cmd_discover before anything is published; declared so that `set -u` reports a
 # programming mistake rather than an unset variable in the middle of a JSON payload.
@@ -391,9 +391,11 @@ cmd_watch() {
         warn "the broker password is set with an empty user name: it is sent anyway, and most brokers reject that. Fill in one, or both."
     fi
 
-    info "SBFspot $("${sbfspot_bin}" -version 2> /dev/null || true)"
     info "inverter $(option '.bt_address') at $(option '.plantname // "MyPlant"'), polled every ${interval_seconds}s"
     info "broker $(mqtt_field '.host'):$(mqtt_field '.port'), state on $(state_topic)"
+
+    # Which SBFspot this is driving is not printed here: whoever runs this asks it of SBFspot, and
+    # the add-on states both versions at start-up because that is what the image installed.
 
     local failures=0 availability="" published_keys=""
     while :; do

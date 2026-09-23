@@ -109,7 +109,7 @@ export FAKE_CONFIG="${work}/fake-config"
 section() { printf '\n--- %s\n' "$1"; }
 
 section "the CLI itself"
-check "version prints the version" "0.1.0" "$("${app}" version)"
+check "version prints the version" "0.1.1" "$("${app}" version)"
 if "${app}" --help | grep -q 'SBFspot'; then
     ok "--help describes the program"
 else
