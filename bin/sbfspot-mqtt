@@ -12,7 +12,7 @@
 # the plant clock to the inverter on *every* poll.
 set -euo pipefail
 
-readonly VERSION=0.1.2
+readonly VERSION=0.1.3
 
 # Filled in by cmd_discover before anything is published; declared so that `set -u` reports a
 # programming mistake rather than an unset variable in the middle of a JSON payload.
@@ -21,9 +21,16 @@ DEVICE_MODEL=""
 DEVICE_SW_VERSION=""
 DEVICE_SERIAL=""
 
-# The keys cmd_discover published a configuration for, in the order they appeared. Read only by
-# retire_stale_discovery, which subtracts them from what is already on the broker.
+# The keys cmd_discover published a configuration for, in the order jq hands them over (sorted).
+# Read only by retire_stale_discovery, which subtracts them from what is already on the broker.
 DISCOVERY_PUBLISHED=()
+
+# Whether `discover` should delete the configurations of the channels this payload does not carry.
+# Off until the caller says `--retire`, because retiring is a claim about the payload — that it is a
+# whole reading rather than a handful of keys somebody typed to see what happens. The poll loop can
+# make that claim, because it is what published the reading it is now looking at. A hand-fed payload
+# cannot, and `discover` is a subcommand anyone can run.
+RETIRE=0
 
 # ---------------------------------------------------------------------------------------------
 # Output. Plain lines, one per event, timestamped the way an add-on log expects to read them.
@@ -54,8 +61,10 @@ Common arguments:
                    discovery_prefix
   --sbfspot PATH   the SBFspot binary (default: /usr/bin/sbfspot/SBFspot)
 
-watch and poll also accept --interval SECONDS, generate-config needs --target FILE, and publish
-takes SBFspot's own `-m <json>`.
+watch and poll also accept --interval SECONDS, generate-config needs --target FILE, publish takes
+SBFspot's own `-m <json>`, and discover accepts `--retire`: it deletes the configuration of a
+channel the payload does not carry, so that an entity does not outlive the channel behind it. Off
+by default — see the comment on RETIRE.
 
 Options come from files because that is what the add-on has; they are read when they are needed,
 so a credential never has to be on a command line or in an environment listing.
@@ -81,6 +90,7 @@ parse_args() {
             --interval) interval="${2:?--interval needs a number}"; shift 2 ;;
             --target) config_target="${2:?--target needs a file}"; shift 2 ;;
             -m) publish_message="${2-}"; shift 2 ;;
+            --retire) RETIRE=1; shift ;;
             *) die "unknown argument: $1 (try --help)" ;;
         esac
     done
@@ -237,8 +247,8 @@ EOF
 # Two of its habits are handled here rather than documented away:
 #
 #   * `to_keyvalue()` ends with `boost::replace_all(key_value, "\"\"", "\"")`, so an empty string
-#     value arrives unterminated — `"InvName": ""` becomes `"InvName": "` — and that is what an
-#     inverter nobody named produces.
+#     value arrives unterminated — `"InvName": ""` becomes `"InvName": "`. Whatever field an
+#     inverter leaves empty arrives this way.
 #   * the message is quoted with a single quote, so a `'` inside a value cuts it off and takes
 #     everything after it. That one cannot be repaired: what follows is gone.
 # ---------------------------------------------------------------------------------------------
@@ -354,15 +364,28 @@ cmd_discover() {
     DEVICE_MODEL="$(jq -r '.InvType // ""' <<< "${payload}")"
     DEVICE_SW_VERSION="$(jq -r '.InvSwVer // ""' <<< "${payload}")"
     DEVICE_NAME="$(jq -r '.InvName // ""' <<< "${payload}")"
-    # SBFspot does not leave `InvName` empty when nobody named the inverter in Sunny Explorer: it
-    # writes the serial in its place — `SN: 1234567890` for an inverter whose serial that is.
-    # Both forms mean unnamed, and both have to reach the fallback below. The comparison takes the
-    # whitespace out of the name first: it is a fixed-length record relayed as raw bytes, so padding
-    # on another firmware would otherwise hide an exact match. A serial that the inverter stores
-    # zero-padded is not covered, and simply falls back to the old behaviour.
+    # An inverter nobody named in Sunny Explorer does not report an empty `InvName`: it reports
+    # `SN: <serial>` as its device name — that is what its own identification page shows, and what
+    # SBFspot relays out of `NameplateLocation`. The fallback below has to recognise it, or the
+    # device in Home Assistant is called after the serial number the page already carries. The
+    # comparison takes the whitespace out of the name first: the field is a fixed-length record
+    # relayed as raw bytes, so padding would otherwise hide an exact match. A serial the inverter
+    # stores zero-padded, or a name that arrives capitalised differently, is not covered — those fall
+    # back to the behaviour that preceded this change rather than to a name somebody did not set.
     if [[ "${DEVICE_NAME//[[:space:]]/}" == "SN:${serial}" ]]; then
         DEVICE_NAME=""
     fi
+    # `node_id`, and the retirement subscription under it, are built from this value. `+` and `#`
+    # would make that subscription match a different node, `/` adds a topic level, and whitespace in
+    # a topic is invisible there and permanent in whatever entity IDs Home Assistant derives from it.
+    # What this enforces is "a serial is one topic segment with nothing invisible in it", not "a
+    # serial is a number": SBFspot prints numbers, so anything carrying one of these is a payload
+    # this program did not produce, and it is refused rather than allowed into a topic.
+    case "${serial}" in
+        *"+"*|*"#"*|*/*|*[[:space:]]*)
+            die "InvSerial '${serial}' is not a serial and cannot go into a topic: refusing to publish discovery"
+            ;;
+    esac
     local node_id="sbfspot_${serial}"
     if [[ -z "${DEVICE_NAME}" ]]; then
         DEVICE_NAME="${DEVICE_MODEL:+SMA ${DEVICE_MODEL}}"
@@ -392,7 +415,9 @@ cmd_discover() {
         esac
     done < <(jq -r 'keys[]' <<< "${payload}")
 
-    retire_stale_discovery "${node_id}"
+    if [[ "${RETIRE}" == "1" ]]; then
+        retire_stale_discovery "${node_id}"
+    fi
 
     info "published discovery under $(mqtt_field '.discovery_prefix // "homeassistant"')/sensor/${node_id}/ for device ${DEVICE_NAME}"
 }
@@ -499,6 +524,10 @@ cmd_watch() {
             else
                 keys="$(jq -r 'keys | sort | join(",")' <<< "${payload}" 2> /dev/null || true)"
                 if [[ -n "${keys}" && "${keys}" != "${published_keys}" ]]; then
+                    # This payload is a whole reading — this program published it from SBFspot's own
+                    # output a moment ago — so discovery can say what is no longer in it. That claim
+                    # is what `--retire` means, and here is the one caller that can make it.
+                    RETIRE=1
                     if printf '%s' "${payload}" | cmd_discover; then
                         published_keys="${keys}"
                     fi

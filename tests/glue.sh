@@ -60,8 +60,11 @@ key() {
 # another, so both are passed rather than glued together.
 config_of() { mosquitto_sub -h localhost -t "homeassistant/sensor/$1/$2/config" -W 2 -C 1 2> /dev/null || true; }
 availability() { mosquitto_sub -h localhost -t "${availability_topic}" -W 2 -C 1 2> /dev/null || true; }
+# The configurations of ONE node. A machine that already had a broker on 1883 keeps whatever another
+# node's run left retained there, and counting those would fail this assertion for a reason that has
+# nothing to do with the code.
 discovery_count() {
-    mosquitto_sub -h localhost -t 'homeassistant/#' -W 2 -v 2> /dev/null | grep -c 'homeassistant/sensor/sbfspot_' || true
+    mosquitto_sub -h localhost -t "homeassistant/sensor/$1/+/config" -W 2 -F '%t' 2> /dev/null | grep -c . || true
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -109,7 +112,7 @@ export FAKE_CONFIG="${work}/fake-config"
 section() { printf '\n--- %s\n' "$1"; }
 
 section "the CLI itself"
-check "version prints the version" "0.1.2" "$("${app}" version)"
+check "version prints the version" "0.1.3" "$("${app}" version)"
 if "${app}" --help | grep -q 'SBFspot'; then
     ok "--help describes the program"
 else
@@ -149,7 +152,7 @@ check "and published as it arrived" "1234.5" "$(key PACTot)"
 check "with the numbers still numbers" "1234567890" "$(key InvSerial)"
 
 # Upstream's to_keyvalue() collapses "" into ", so an empty value arrives unterminated:
-# `"InvName": ""` becomes `"InvName": "`. This is what an inverter nobody named produces.
+# `"InvName": ""` becomes `"InvName": "`. It is repaired for whatever field the inverter leaves empty.
 collapsed='{"Timestamp": "2026-09-23T19:00:00","InvSerial": 987654321,"InvName": ","InvStatus": "Ok"}'
 check "the empty-value corruption is repaired, not refused" "0" "$(publish "${collapsed}")"
 check "the empty value comes back as an empty string" "" "$(key InvName)"
@@ -188,7 +191,7 @@ printf '%s' "${payload}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
 # The shape of a real reading: the array arrives in the second MPPT slot and the first is a hard
 # zero, which is the inverter's own report of a string input nobody wired. Seventeen configurations:
 # eleven fixed sensors plus six for the two slots upstream always answers.
-check "17 configurations are published" "17" "$(discovery_count)"
+check "17 configurations are published" "17" "$(discovery_count sbfspot_1234567890)"
 
 power="$(config_of sbfspot_1234567890 pactot)"
 check "power carries its unit" "W" "$(printf '%s' "${power}" | jq -r '.unit_of_measurement')"
@@ -231,23 +234,33 @@ check "and the serial is still the serial number" "1234567890" \
 section "discovery retires what it no longer publishes"
 # A published configuration creates an entity; an empty retained payload on the same topic deletes
 # it. Without that, a channel that stops being reported — a firmware update, or a reading list that
-# was trimmed — leaves behind an entity whose value template resolves to nothing.
+# was trimmed — leaves behind an entity whose value template resolves to nothing. The deletion needs
+# `--retire`, because it is a claim that the payload is a whole reading, and only the poll loop is in
+# a position to make that claim.
 two='{"InvSerial":4242,"InvName":"Two strings","ETotal":1.0,"PDC1":1300.0,"PDC2":0.0}'
 printf '%s' "${two}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
 check "a channel that appears gets a configuration" "yes" \
     "$(config_of sbfspot_4242 pdc1 | jq -e '.unique_id == "sbfspot_4242_pdc1"' > /dev/null 2>&1 && echo yes || echo no)"
 one='{"InvSerial":4242,"InvName":"One string","ETotal":1.0,"PDC2":1700.0}'
 printf '%s' "${one}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
-check "and one that stops appearing is retired" "" "$(config_of sbfspot_4242 pdc1)"
+check "a plain discover publishes without deleting anything" "yes" \
+    "$(config_of sbfspot_4242 pdc1 | jq -e '.unique_id == "sbfspot_4242_pdc1"' > /dev/null 2>&1 && echo yes || echo no)"
+printf '%s' "${one}" | "${app}" discover --retire --mqtt "${mqtt}" > /dev/null
+check "and one that stops appearing is retired, on request" "" "$(config_of sbfspot_4242 pdc1)"
 check "while the one still reported stays" "yes" \
     "$(config_of sbfspot_4242 pdc2 | jq -e '.unique_id == "sbfspot_4242_pdc2"' > /dev/null 2>&1 && echo yes || echo no)"
-# `discover` is a public subcommand, and a payload with nothing mappable in it is not evidence that
-# the sensors went away: retiring on the strength of one would take every entity this inverter has
-# off Home Assistant. An empty set is skipped.
+# A payload with nothing mappable in it is not evidence that the sensors went away: retiring on the
+# strength of one would take every entity this inverter has off Home Assistant.
 empty='{"InvSerial":4242,"InvName":"Nothing here to map"}'
-printf '%s' "${empty}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+printf '%s' "${empty}" | "${app}" discover --retire --mqtt "${mqtt}" > /dev/null
 check "a payload with nothing to publish retires nothing" "yes" \
     "$(config_of sbfspot_4242 pdc2 | jq -e '.unique_id == "sbfspot_4242_pdc2"' > /dev/null 2>&1 && echo yes || echo no)"
+# A serial that would move the retirement subscription onto another node — or into a topic of its
+# own — never reaches one.
+for bad in '42+42' '42#42' '42/42' '   '; do
+    check "the serial '${bad}' is refused" "1" \
+        "$(printf '{"InvSerial":"%s","PACTot":1.0}' "${bad}" | "${app}" discover --retire --mqtt "${mqtt}" > /dev/null 2>&1; echo $?)"
+done
 
 section "watch: the loop"
 # A fake that always fails, and a loop that must not die of it: three failures mark the inverter
@@ -274,6 +287,13 @@ fi
 
 # A fake that reports a reading: the loop publishes it, publishes discovery, and marks online.
 export FAKE_PAYLOAD='{"InvSerial": 777,"InvName": "Watched","InvType":"SB 3000TL-20","PACTot": 99.0}'
+# The loop is the one caller allowed to retire: it knows the reading it is looking at is a whole
+# one. A configuration left behind by a channel this reading does not carry goes with it, and the
+# channels it does carry stay — so there has to be a stale one to begin with.
+mosquitto_pub -h localhost -t 'homeassistant/sensor/sbfspot_777/etotal/config' -r \
+    -m "{\"name\":\"Energy total\",\"unique_id\":\"sbfspot_777_etotal\",\"state_topic\":\"${state_topic}\"}"
+check "a stale configuration is on the broker to begin with" "yes" \
+    "$(config_of sbfspot_777 etotal | jq -e '.unique_id == "sbfspot_777_etotal"' > /dev/null 2>&1 && echo yes || echo no)"
 "${app}" offline --mqtt "${mqtt}" > /dev/null 2>&1
 rc=0
 timeout 12 "${app}" watch --options "${options}" --mqtt "${mqtt}" --sbfspot "${fake}" \
@@ -282,6 +302,7 @@ check "the loop survives being killed by the supervisor" "124" "${rc}"
 check "a successful read marks the inverter online" "online" "$(availability)"
 check "and the reading reaches the broker" "99.0" "$(key PACTot)"
 check "and its discovery was published" "yes" "$(config_of sbfspot_777 pactot | jq -e '.device.model == "SB 3000TL-20"' > /dev/null 2>&1 && echo yes || echo no)"
+check "and the channel it no longer carries was retired by the loop" "" "$(config_of sbfspot_777 etotal)"
 unset FAKE_PAYLOAD
 
 printf '\n'

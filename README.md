@@ -77,7 +77,8 @@ bin/sbfspot-mqtt watch \
   --sbfspot /usr/local/bin/SBFspot
 ```
 
-`--log-level debug` is passed through to SBFspot as `-v5`, which is its full configuration and
+`log_level: debug` in the options file is passed through to SBFspot as `-v5`, which is its full
+configuration and
 data dump: useful for one diagnosis, unreadable as a permanent setting.
 
 ## What it publishes
@@ -114,6 +115,10 @@ neither is:
   input nobody wired" — disable them in Home Assistant if they are in the way on the device page.
 - discovery is a set, not a list that only grows: a channel that stops appearing in the reading has
   its configuration deleted from the broker, so an entity does not outlive the channel behind it.
+  The poll loop does that on its own; `discover` does it only when asked with `--retire`. Deleting
+  is a claim that the payload is a whole reading, and the loop is the only caller in a position to
+  make it — it is what publishes the reading it is now looking at, and a payload somebody typed by
+  hand is not.
 
 If the inverter stops answering, every entity goes **unavailable** after three failed polls, and
 comes back on the next successful one. Stopping the program publishes `offline` too, so a stopped
@@ -129,8 +134,8 @@ bridge does not leave an hour-old value looking current.
   point back at `sbfspot-mqtt publish`, so the credentials stay in a file that the command line
   only names.
 - **Two of upstream's habits are handled instead of documented away.** `to_keyvalue()` collapses
-  an empty string value into an unterminated one — `"InvName": ""` arrives as `"InvName": "`, which
-  is what an inverter nobody named produces — and that is repaired. A payload cut off by a single
+  an empty string value into an unterminated one — `"InvName": ""` arrives as `"InvName": "` — and
+  that is repaired. A payload cut off by a single
   quote inside a value cannot be repaired, because the rest is gone: it is refused, with the raw
   text in the log, rather than published as a sensor that stops updating.
 - **Discovery is derived from a real payload**, not from a wish list: a sensor is published for a
