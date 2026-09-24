@@ -109,7 +109,7 @@ export FAKE_CONFIG="${work}/fake-config"
 section() { printf '\n--- %s\n' "$1"; }
 
 section "the CLI itself"
-check "version prints the version" "0.1.1" "$("${app}" version)"
+check "version prints the version" "0.1.2" "$("${app}" version)"
 if "${app}" --help | grep -q 'SBFspot'; then
     ok "--help describes the program"
 else
@@ -126,6 +126,14 @@ check "writes the inverter address" "BTAddress=00:11:22:33:44:55" "$(grep '^BTAd
 # Bluetooth on every poll. A regression here silently starts writing to the inverter.
 check "disables the clock write" "SynchTime=0" "$(grep '^SynchTime=' "${cfg}")"
 check "writes no database" "CSV_Export=0" "$(grep '^CSV_Export=' "${cfg}")"
+# The reading asks for *every* MPPT slot. Naming one would read the array of a model that reports
+# in the other slot as zeros and drop it — upstream's `pdc2` reads slot two alone — so the channels
+# stay as wide as the protocol and a permanently-zero set is dealt with where entities are.
+channels="$(grep '^MQTT_Data=' "${cfg}")"
+check "the reading asks for every MPPT slot" "yes" \
+    "$(grep -qE ',PDC,IDC,UDC,' <<< "${channels}" && echo yes || echo no)"
+check "and not for one slot by name" "yes" \
+    "$(grep -qE '(PDC[0-9]|IDC[0-9]|UDC[0-9])' <<< "${channels}" && echo no || echo yes)"
 check "points the publisher hook at this program" "MQTT_Publisher=${app}" "$(grep '^MQTT_Publisher=' "${cfg}")"
 check "keeps the file private" "600" "$(stat -c %a "${cfg}")"
 check "refuses a plantname with a quote" "1" \
@@ -175,10 +183,11 @@ check "and the generated configuration inside the poll had SynchTime=0" "SynchTi
 unset FAKE_PAYLOAD
 
 section "discovery"
-payload='{"Timestamp":"2026-09-23T19:00:00","Plantname":"TestPlant","InvSerial":1234567890,"InvName":"Test inverter","InvTime":"2026-09-23T19:00:00","InvStatus":"Ok","InvTemperature":35.5,"InvGridRelay":"Closed","InvClass":"Solar Inverters","InvType":"SB 3000TL-20","InvSwVer":"03.30.06.R","EToday":12.34,"ETotal":12345.67,"PACTot":1234.5,"PDC1":1300.0,"PDC2":0.0,"IDC1":3.6,"IDC2":0.0,"UDC1":365.0,"UDC2":0.0,"GridFreq":50.01,"OperTm":34567.0,"FeedTm":33456.0}'
+payload='{"Timestamp":"2026-09-23T19:00:00","Plantname":"TestPlant","InvSerial":1234567890,"InvName":"Test inverter","InvTime":"2026-09-23T19:00:00","InvStatus":"Ok","InvTemperature":35.5,"InvGridRelay":"Closed","InvClass":"Solar Inverters","InvType":"SB 3000TL-20","InvSwVer":"03.30.06.R","EToday":12.34,"ETotal":12345.67,"PACTot":1234.5,"PDC1":0.0,"PDC2":1700.0,"IDC1":0.0,"IDC2":6.899,"UDC1":0.0,"UDC2":246.44,"GridFreq":50.01,"OperTm":34567.0,"FeedTm":33456.0}'
 printf '%s' "${payload}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
-# 11 fixed sensors plus six for the two strings upstream always reports — upstream seeds both
-# MPPT slots before every read, so a single-string inverter reports the second as 0.
+# The shape of a real reading: the array arrives in the second MPPT slot and the first is a hard
+# zero, which is the inverter's own report of a string input nobody wired. Seventeen configurations:
+# eleven fixed sensors plus six for the two slots upstream always answers.
 check "17 configurations are published" "17" "$(discovery_count)"
 
 power="$(config_of sbfspot_1234567890 pactot)"
@@ -203,6 +212,42 @@ else
 fi
 check "a payload without a serial is refused" "1" \
     "$(printf '%s' '{"InvName":"X"}' | "${app}" discover --mqtt "${mqtt}" > /dev/null 2>&1; echo $?)"
+
+# SBFspot does not leave `InvName` empty for an inverter nobody named in Sunny Explorer: it writes
+# the serial in its place. Both forms have to reach the fallback, or the device in Home Assistant
+# is called "SN: 1234567890" — which says nothing the device page does not already say, and hides
+# the model that a person would recognise.
+named='{"InvSerial":1234567890,"InvName":"Test inverter","InvType":"SB 3000TL-20","PACTot":1.0}'
+unnamed='{"InvSerial":1234567890,"InvName":"SN: 1234567890","InvType":"SB 3000TL-20","PACTot":1.0}'
+printf '%s' "${named}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+check "a name set in Sunny Explorer is used as it is" "Test inverter" \
+    "$(config_of sbfspot_1234567890 pactot | jq -r '.device.name')"
+printf '%s' "${unnamed}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+check "the serial placeholder is not mistaken for a name" "SMA SB 3000TL-20" \
+    "$(config_of sbfspot_1234567890 pactot | jq -r '.device.name')"
+check "and the serial is still the serial number" "1234567890" \
+    "$(config_of sbfspot_1234567890 pactot | jq -r '.device.serial_number')"
+
+section "discovery retires what it no longer publishes"
+# A published configuration creates an entity; an empty retained payload on the same topic deletes
+# it. Without that, a channel that stops being reported — a firmware update, or a reading list that
+# was trimmed — leaves behind an entity whose value template resolves to nothing.
+two='{"InvSerial":4242,"InvName":"Two strings","ETotal":1.0,"PDC1":1300.0,"PDC2":0.0}'
+printf '%s' "${two}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+check "a channel that appears gets a configuration" "yes" \
+    "$(config_of sbfspot_4242 pdc1 | jq -e '.unique_id == "sbfspot_4242_pdc1"' > /dev/null 2>&1 && echo yes || echo no)"
+one='{"InvSerial":4242,"InvName":"One string","ETotal":1.0,"PDC2":1700.0}'
+printf '%s' "${one}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+check "and one that stops appearing is retired" "" "$(config_of sbfspot_4242 pdc1)"
+check "while the one still reported stays" "yes" \
+    "$(config_of sbfspot_4242 pdc2 | jq -e '.unique_id == "sbfspot_4242_pdc2"' > /dev/null 2>&1 && echo yes || echo no)"
+# `discover` is a public subcommand, and a payload with nothing mappable in it is not evidence that
+# the sensors went away: retiring on the strength of one would take every entity this inverter has
+# off Home Assistant. An empty set is skipped.
+empty='{"InvSerial":4242,"InvName":"Nothing here to map"}'
+printf '%s' "${empty}" | "${app}" discover --mqtt "${mqtt}" > /dev/null
+check "a payload with nothing to publish retires nothing" "yes" \
+    "$(config_of sbfspot_4242 pdc2 | jq -e '.unique_id == "sbfspot_4242_pdc2"' > /dev/null 2>&1 && echo yes || echo no)"
 
 section "watch: the loop"
 # A fake that always fails, and a loop that must not die of it: three failures mark the inverter

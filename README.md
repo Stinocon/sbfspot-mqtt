@@ -91,7 +91,7 @@ One device in Home Assistant, named after the inverter, with the sensors it repo
 | Energy total | kWh | Lifetime yield — this is the one for the Energy dashboard. |
 | Status | — | `Ok`, `Derating`, `Fault`, … as the inverter reports it. |
 | Temperature | °C | |
-| DC voltage / current / power, string N | V / A / W | Upstream always reports two strings, so both exist; a single-string inverter reports the second as 0. |
+| DC voltage / current / power, string N | V / A / W | One set per string the inverter reports; an input nobody wired reads zero. |
 | Grid frequency | Hz | |
 | Operating time, Feed-in time | h | Lifetime counters. |
 | Grid relay, Inverter time, Data timestamp | — | Diagnostic entities, kept out of the way of a dashboard. |
@@ -105,9 +105,15 @@ neither is:
 
 - the channels *asked for* are a fixed list, and SBFspot answers every one of them — with `0` or
   `?` when the model has no such channel. A constant zero on the device page means the inverter
-  does not have that channel.
-- upstream seeds both MPPT slots before every read, so there are always two DC strings, and a
-  single-string inverter reports the second as 0.
+  reports nothing on that channel; it is not a fault.
+- both MPPT slots are asked for, and an inverter that uses one of them reports a hard zero on the
+  other: on the Sunny Boy this was written for, the array arrives in the *second* slot and the
+  first reads 0 V, 0 A and 0 W on every poll. Which slot a model fills is the inverter's business
+  and not something this program can know, so it asks for both rather than naming one. What that
+  costs is three entities that read zero for as long as the installation exists, saying "a string
+  input nobody wired" — disable them in Home Assistant if they are in the way on the device page.
+- discovery is a set, not a list that only grows: a channel that stops appearing in the reading has
+  its configuration deleted from the broker, so an entity does not outlive the channel behind it.
 
 If the inverter stops answering, every entity goes **unavailable** after three failed polls, and
 comes back on the next successful one. Stopping the program publishes `offline` too, so a stopped
@@ -127,9 +133,10 @@ bridge does not leave an hour-old value looking current.
   is what an inverter nobody named produces — and that is repaired. A payload cut off by a single
   quote inside a value cannot be repaired, because the rest is gone: it is refused, with the raw
   text in the log, rather than published as a sensor that stops updating.
-- **Discovery is derived from a real payload**, not from a wish list: the DC-string sensors follow
-  the strings the inverter actually reports, and a key with no mapping is reported and skipped, so
-  a channel nobody has seen yet gets noticed instead of invented.
+- **Discovery is derived from a real payload**, not from a wish list: a sensor is published for a
+  key the reading actually carries, and a key with no mapping is reported and skipped, so a channel
+  nobody has seen yet gets noticed instead of invented. It subtracts as well: a channel that stops
+  appearing has its configuration deleted, rather than left on the broker describing nothing.
 
 ## Development
 
