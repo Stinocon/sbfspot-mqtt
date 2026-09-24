@@ -140,8 +140,9 @@ bridge does not leave an hour-old value looking current.
   text in the log, rather than published as a sensor that stops updating.
 - **Discovery is derived from a real payload**, not from a wish list: a sensor is published for a
   key the reading actually carries, and a key with no mapping is reported and skipped, so a channel
-  nobody has seen yet gets noticed instead of invented. It subtracts as well: a channel that stops
-  appearing has its configuration deleted, rather than left on the broker describing nothing.
+  nobody has seen yet gets noticed instead of invented. It subtracts as well: in the poll loop, a
+  channel that stops appearing has its configuration deleted, rather than left on the broker
+  describing nothing.
 
 ## Development
 
