@@ -6,3 +6,6 @@
 .idea/
 .vscode/
 *.swp
+
+# local agent memory and decisions: never published
+/.pi/
