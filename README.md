@@ -38,7 +38,8 @@ to switch the other master off.
 ```
 sbfspot-mqtt watch            # the normal mode: poll, publish, publish discovery when it changes
 sbfspot-mqtt poll             # one read, one publish
-sbfspot-mqtt discover         # read a payload on stdin and publish discovery from it
+sbfspot-mqtt discover         # read a payload on stdin and publish discovery from it;
+                              #   with --retire, also delete the channels it no longer carries
 sbfspot-mqtt publish          # SBFspot's publisher interface, called by SBFspot
 sbfspot-mqtt offline          # mark the inverter offline on the availability topic
 sbfspot-mqtt generate-config  # write the SBFspot configuration from the options
@@ -78,12 +79,12 @@ bin/sbfspot-mqtt watch \
 ```
 
 `log_level: debug` in the options file is passed through to SBFspot as `-v5`, which is its full
-configuration and
-data dump: useful for one diagnosis, unreadable as a permanent setting.
+configuration and data dump: useful for one diagnosis, unreadable as a permanent setting.
 
 ## What it publishes
 
-One device in Home Assistant, named after the inverter, with the sensors it reports:
+One device in Home Assistant — named after the inverter, or after its model when nobody named it —
+with the sensors it reports:
 
 | Sensor | Unit | Notes |
 |--------|------|-------|
@@ -101,8 +102,8 @@ One device in Home Assistant, named after the inverter, with the sensors it repo
 total**: it carries `device_class: energy`, `state_class: total_increasing` and `kWh`, which is
 what the dashboard requires.
 
-Two things about that list are worth knowing in advance, because both look like faults and
-neither is:
+Three things about that list are worth knowing in advance, because all three look like faults and
+none is:
 
 - the channels *asked for* are a fixed list, and SBFspot answers every one of them — with `0` or
   `?` when the model has no such channel. A constant zero on the device page means the inverter
